@@ -1,141 +1,369 @@
-from collections import defaultdict
-from typing import Dict, List
-
+from Transaction import Transaction
 from DataManager import DataManager
-from Transaction import Transaction, TransactionType
-from Operation import Operation, OperationType
+
 
 class TransactionManager:
-    SITE_COUNT = 10
-
     def __init__(self):
-        self.sites = {i: DataManager(i) for i in range(1, TransactionManager.SITE_COUNT + 1)}
-        self.transactions: Dict[int, Transaction] = {}
-        self.waiting_operations: List[Operation] = []
-        self.waits_for_graph: Dict[int, set] = defaultdict(set)
+        self.sites = {i: DataManager(i) for i in range(1, 11)}  # 10 sites, indexed 1 to 10
+        self.transactions = {}  # Active transactions: transaction_id -> Transaction object
+        self.site_status = {i: "up" for i in range(1, 11)}  # Site status: "up"/"down"
+        self.failure_history = {i: [] for i in range(1, 11)}  # Failure history: site_id -> list of failure/recovery events
+        self.waiting_read_queue = []  # Queue for waiting reads: list of (transaction_id, variable, site_id)
+        self.serialization_graph = {}  # Graph to represent dependencies: {TID -> [TIDs it depends on]}
 
-    def begin(self, tid: int, ts: int) -> None:
-        if tid not in self.transactions:
-            self.transactions[tid] = Transaction(tid, ts, TransactionType.READ_WRITE)
-            print(f"T{tid} begins")
+        # Initialize data variables
+        self.initialize_data()
 
-    def begin_ro(self, tid: int, ts: int) -> None:
-        if tid not in self.transactions:
-            self.transactions[tid] = Transaction(tid, ts, TransactionType.READ_ONLY)
-            print(f"T{tid} begins and is read-only")
+    def initialize_data(self):
+        """Initialize the 20 variables across the 10 sites based on their index."""
+        for i in range(1, 21):  # Variables x1 to x20
+            initial_value = 10 * i
+            if i % 2 == 0:  # Even-indexed variables
+                for site_id in self.sites:
+                    self.sites[site_id].write(f"x{i}", initial_value, 0)
+            else:  # Odd-indexed variables
+                site_id = 1 + (i % 10)
+                self.sites[site_id].write(f"x{i}", initial_value, 0)
 
-    def end(self, tid: int, ts: int) -> None:
-        if tid in self.transactions:
-            transaction = self.transactions[tid]
-            if transaction.is_aborted():
-                print(f"T{tid} aborts due to previous access of a down site")
-                self.abort(tid)
-            else:
-                if transaction.get_type() == TransactionType.READ_WRITE:
-                    for site_id in transaction.get_accessed_sites():
-                        self.sites[site_id].commit(tid, ts)
-                print(f"T{tid} commits")
-                del self.transactions[tid]
-                self.waits_for_graph.pop(tid, None)
-                self.retry()
+    def print_serialization_graph(self):
+        print("\n--- Serialization Graph ---")
+        for from_tid, to_tids in self.serialization_graph.items():
+            print(f"T{from_tid} -> {', '.join(f'T{tid}' for tid in to_tids)}")
+        print("----------------------------")
 
-    def read(self, tid: int, vid: int, ts: int) -> None:
-        if tid not in self.transactions:
-            return
-        transaction = self.transactions[tid]
-        operation = Operation(ts, tid, vid, OperationType.READ, 0)
-        for site_id, site in self.sites.items():
-            if site.can_read(transaction.get_type(), operation):
-                value = site.read(transaction.get_type(), transaction.get_timestamp(), operation)
-                transaction.add_accessed_site(site_id)
-                transaction.unblock()
-                print(f"T{tid} reads x{vid}: {value}")
-                return
-        self.waiting_operations.append(operation)
-        transaction.block()
-        print(f"T{tid} blocked")
-        self.detect_deadlock(tid)
+    def start_transaction(self, transaction_id, timestamp, is_read_only=False):
+        """Begin a new transaction."""
+        print(f"Starting {'read-only ' if is_read_only else ''}transaction T{transaction_id} at timestamp {timestamp}.")
+        self.transactions[transaction_id] = Transaction(transaction_id, timestamp, is_read_only)
 
-    def write(self, tid: int, vid: int, value: int, ts: int) -> None:
-        if tid not in self.transactions:
-            return
-        transaction = self.transactions[tid]
-        operation = Operation(ts, tid, vid, OperationType.WRITE, value)
-        can_write = all(
-            site.is_active() and site.can_write(transaction.get_type(), operation)
-            for site in self.sites.values()
-        )
-        if can_write:
-            for site in self.sites.values():
-                if site.is_active() and site.contains_variable(vid):
-                    site.write(transaction.get_type(), operation)
-                    transaction.add_accessed_site(site.get_id())
-            transaction.unblock()
-            print(f"T{tid} writes x{vid}: {value}")
+    def read_intention(self, transaction_id, variable):
+        """
+        Add a read intention to the transaction's instruction queue and attempt the read immediately.
+        Calls the DataManager's read method to retrieve the value.
+        Aborts the transaction if no valid site can provide the value.
+        """
+        if transaction_id not in self.transactions:
+            raise Exception(f"Transaction T{transaction_id} does not exist.")
+
+        transaction = self.transactions[transaction_id]
+
+        # Add the variable to the transaction's read set
+        transaction.add_read(variable)
+
+        # Determine the sites where the variable is stored
+        sites_to_read = []
+        variable_index = int(variable[1:])  # Extract the numeric part of the variable name
+
+        if variable_index % 2 == 0:
+            # Even-indexed variables (replicated): available on all sites
+            sites_to_read = [site_id for site_id, site in self.sites.items()]
         else:
-            self.waiting_operations.append(operation)
-            transaction.block()
-            print(f"T{tid} blocked")
-            self.detect_deadlock(tid)
+            # Odd-indexed variables (non-replicated): stored on a single site
+            site_id = 1 + (variable_index % 10)
 
-    def dump(self) -> None:
-        for site in self.sites.values():
-            site.dump()
+            sites_to_read = [site_id]
 
-    def fail(self, sid: int) -> None:
-        if sid in self.sites:
-            self.sites[sid].fail()
-            for transaction in self.transactions.values():
-                if transaction.has_accessed_site(sid):
-                    transaction.set_aborted()
-            print(f"site {sid} fails")
+        # Attempt to read from the available sites
+        for site_id in sites_to_read:
+            if self.site_status[site_id] == "up":
+                try:
+                    # Calculate the last commit time for the variable
+                    last_commit_time = None
+                    for value, commit_time in reversed(self.sites[site_id].version_history[variable]):
+                        if commit_time <= transaction.start_time:
+                            last_commit_time = commit_time
+                            break
 
-    def recover(self, sid: int) -> None:
-        if sid in self.sites:
-            self.sites[sid].recover()
-            print(f"site {sid} recovers")
-            self.retry()
+                    # Check failure history before attempting the read
+                    if last_commit_time is not None:
+                        for failure_time, status in self.failure_history[site_id]:
+                            if last_commit_time < failure_time < transaction.start_time:
+                                # print(f"Skipping Site {site_id} for {variable}: Last commit time {last_commit_time} is invalid "
+                                #    f"due to failure at {failure_time}.")
+                                raise Exception("Site not functional during required period.")
 
-    def abort(self, tid: int) -> None:
-        for site in self.sites.values():
-            site.abort(tid)
-        self.transactions.pop(tid, None)
-        self.retry()
-
-    def retry(self) -> None:
-        for operation in self.waiting_operations[:]:
-            tid = operation.get_transaction_id()
-            if tid not in self.transactions:
-                continue
-            if operation.get_type() == OperationType.READ:
-                self.read(tid, operation.get_variable_id(), operation.get_timestamp())
+                    # Attempt to read from the site
+                    value = self.sites[site_id].read(variable, transaction.start_time)
+                    print(f"Transaction T{transaction_id} read {variable}:{value} from Site {site_id}.")
+                    return value  # Return the first successful read
+                except Exception as e:
+                    pass
+                    # print(f"Transaction T{transaction_id} failed to read {variable} from Site {site_id}: {e}")
             else:
-                self.write(tid, operation.get_variable_id(), operation.get_value(), operation.get_timestamp())
-            if not self.transactions[tid].is_blocked():
-                self.waiting_operations.remove(operation)
+                try:
+                    # Calculate the last commit time for the variable
+                    last_commit_time = None
+                    for value, commit_time in reversed(self.sites[site_id].version_history[variable]):
+                        if commit_time <= transaction.start_time:
+                            last_commit_time = commit_time
+                            break
 
-    def detect_deadlock(self, tid: int) -> None:
+                    # Check failure history before attempting the read
+                    if last_commit_time is not None:
+                        for failure_time, status in self.failure_history[site_id]:
+                            if last_commit_time < failure_time < transaction.start_time:
+                                # print(f"Skipping Site {site_id} for {variable}: Last commit time {last_commit_time} is invalid "
+                                #    f"due to failure at {failure_time}.")
+                                raise Exception("Site not functional during required period.")
+
+                    self.waiting_read_queue.append([transaction_id, variable_index, site_id])
+                    return
+                except Exception as e:
+                    pass
+
+        # If no valid site can provide the value, abort the transaction
+        print(f"Transaction T{transaction_id} aborted: No valid site could provide the value for {variable}.")
+        transaction.status = "aborted"
+        return None
+
+    def write_intention(self, transaction_id, variable, value, timestamp):
+        """
+        Add a write intention to the transaction's instruction queue.
+        The actual write will be handled during commit.
+        """
+        if transaction_id not in self.transactions:
+            raise Exception(f"Transaction T{transaction_id} does not exist.")
+
+        transaction = self.transactions[transaction_id]
+        transaction.add_write(variable, value, timestamp)
+        # print(f"Transaction T{transaction_id} added write intention for {variable} = {value}.")
+
+    def commit(self, transaction_id, time):
+        """
+        Commit a transaction after validation.
+        Implements:
+        1. First Committer Wins rule.
+        2. Abort if any write timestamp precedes the failure timestamp of a site.
+        """
+        if transaction_id not in self.transactions:
+            raise Exception(f"Transaction T{transaction_id} does not exist.")
+
+        transaction = self.transactions[transaction_id]
+
+        # Check for First Committer Wins violation and failure timestamp validation
+        for variable, (value, write_timestamp) in transaction.write_set.items():
+            for site_id, site in self.sites.items():
+                if self.site_status[site_id] == "up" and (variable in site.variables or variable.startswith("x")):
+                    # First Committer Wins Check
+                    if variable in site.version_history:
+                        last_commit_time = site.version_history[variable][-1][1]
+                        if last_commit_time > transaction.start_time:
+                            print(
+                                f"Transaction T{transaction_id} aborted: {variable} was committed at {last_commit_time}, "
+                                f"after transaction start time {transaction.start_time}.")
+                            transaction.status = "aborted"
+                            return
+
+                # Failure Timestamp Validation
+                for failure_timestamp, status in self.failure_history[site_id]:
+                    if status == "down" and write_timestamp < failure_timestamp:
+                        print(
+                            f"Transaction T{transaction_id} aborted: Write timestamp {write_timestamp} for {variable} "
+                            f"precedes failure timestamp {failure_timestamp} on Site {site_id}.")
+                        transaction.status = "aborted"
+                        return
+
+        for variable, (value, write_timestamp) in transaction.write_set.items():
+            # Distribute writes to the appropriate sites
+            written_sites = set()
+            variable_index = int(variable[1:])  # Extract the numeric part of the variable name
+
+            if variable_index % 2 == 0:
+                # Even-indexed variables: Write to all sites that are up
+                for site_id, site in self.sites.items():
+                    if self.site_status[site_id] == "up" and variable in site.variables:
+                        # Retrieve the last recovery timestamp
+                        last_recovery_time = max(
+                            (timestamp for timestamp, status in self.failure_history[site_id] if status == "up"),
+                            default=None
+                        )
+
+                        # Check if the write timestamp is valid
+                        if last_recovery_time is not None and write_timestamp < last_recovery_time:
+                            continue
+
+                        # Perform the write and track the site
+                        site.write(variable, value, write_timestamp)
+                        written_sites.add(site_id)
+            else:
+                # Odd-indexed variables: Write to a single designated site
+                site_id = 1 + (variable_index % 10)
+                if self.site_status[site_id] == "up" and variable in self.sites[site_id].variables:
+                    # Retrieve the last recovery timestamp
+                    last_recovery_time = max(
+                        (timestamp for timestamp, status in self.failure_history[site_id] if status == "up"),
+                        default=None
+                    )
+
+                    # Check if the write timestamp is valid
+                    if last_recovery_time is not None and write_timestamp < last_recovery_time:
+                        continue
+
+                    # Perform the write and track the site
+                    self.sites[site_id].write(variable, value, write_timestamp)
+                    written_sites.add(site_id)
+
+            # Print the sites written to in a single line
+            if written_sites:
+                written_sites_list = sorted(written_sites)  # Sort for consistent output
+                print(
+                    f"Transaction T{transaction_id} wrote {variable} to sites: {', '.join(map(str, written_sites_list))}")
+
+            # Construct edges in the serialization graph
+            for other_tid, other_txn in self.transactions.items():
+                if other_tid == transaction_id or other_txn.status != "committed":
+                    continue
+
+                # RW Edge: other_tid wrote to a variable that transaction_id read
+                if any(var in other_txn.write_set for var in transaction.read_set):
+                    self.add_dependency(transaction_id, other_tid)
+
+                # WR Edge: transaction_id wrote to a variable that other_tid read
+                if any(var in transaction.write_set for var in other_txn.read_set):
+                    self.add_dependency(other_tid, transaction_id)
+
+                # WW Edge: both transactions wrote to the same variable
+                if any(var in transaction.write_set for var in other_txn.write_set):
+                    self.add_dependency(other_tid, transaction_id)
+
+            # Print serialization graph for debugging
+            self.print_serialization_graph()
+
+            # Check for cycles in the serialization graph
+            if self.has_cycle():
+                last_tid = self.get_last_transaction_in_cycle()
+                print(f"Cycle detected! Aborting transaction T{last_tid}.")
+                self.transactions[last_tid].status = "aborted"
+                self.remove_transaction_from_graph(last_tid)
+                return
+
+        # Mark the transaction as committed
+        transaction.status = "committed"
+        print(f"Transaction T{transaction_id} has been committed.")
+
+    def update_site_status(self, site_id, status, timestamp):
+        """
+        Update the status of a site (up/down).
+        Records the failure or recovery event with a timestamp.
+        """
+        if site_id not in self.sites:
+            raise Exception(f"Site {site_id} does not exist.")
+
+        if status == "down":
+            if self.site_status[site_id] != "down":
+                self.sites[site_id].fail()
+                self.failure_history[site_id].append((timestamp, "down"))
+                self.site_status[site_id] = status
+        elif status == "up":
+            if self.site_status[site_id] != "up":
+                # Recover the site
+                self.sites[site_id].recover()
+                self.failure_history[site_id].append((timestamp, "up"))
+                self.site_status[site_id] = status
+                print(f"Site {site_id} has been recovered.")
+
+                # Process the waiting read queue
+                for entry in list(self.waiting_read_queue):  # Use a copy to allow modification during iteration
+                    transaction_id, variable_index, waiting_site_id = entry
+                    if waiting_site_id == site_id:  # Check if the recovered site matches the waiting read site
+                        variable = f"x{variable_index}"  # Convert the variable index back to its name
+                        try:
+                            value = self.sites[site_id].read(variable, self.transactions[transaction_id].start_time)
+                            print(
+                                f"Transaction T{transaction_id} read {variable}:{value} from recovered Site {site_id}.")
+                            # Remove the entry from the queue since it has been processed
+                            self.waiting_read_queue.remove(entry)
+                        except Exception as e:
+                            print(
+                                f"Transaction T{transaction_id} failed to read {variable} from recovered Site {site_id}: {e}")
+
+        self.site_status[site_id] = status
+        # print(f"Site {site_id} status updated to {status} at timestamp {timestamp}.")
+
+    def get_failure_history(self, site_id):
+        """
+        Retrieve the failure history of a specific site.
+        """
+        if site_id not in self.failure_history:
+            raise Exception(f"Site {site_id} does not exist.")
+        return self.failure_history[site_id]
+
+    def querystate(self):
+        """Print the current state of the system for debugging."""
+        print("\n--- Dump State ---")
+        for site_id, dm in self.sites.items():
+            # Sort variables by the numeric part of their names
+            sorted_variables = sorted(dm.variables.items(), key=lambda item: int(item[0][1:]))
+
+            # Format variable-value pairs as a string
+            site_data = ", ".join(f"{var}: {val}" for var, val in sorted_variables)
+
+            # Check the site status and include it in the output
+            if self.site_status[site_id] == "down":
+                print(f"site {site_id} (down) – {site_data}")
+            else:
+                print(f"site {site_id} – {site_data}")
+        print("--------------------")
+
+    def add_dependency(self, from_tid, to_tid):
+        """Add a directed edge in the serialization graph."""
+        if from_tid not in self.serialization_graph:
+            self.serialization_graph[from_tid] = set()
+        self.serialization_graph[from_tid].add(to_tid)
+
+    def remove_transaction_from_graph(self, tid):
+        """Remove a transaction from the graph."""
+        if tid in self.serialization_graph:
+            del self.serialization_graph[tid]
+        for dependencies in self.serialization_graph.values():
+            dependencies.discard(tid)
+
+    def has_cycle(self):
+        """Detect a cycle in the serialization graph."""
         visited = set()
-        cycle = self._detect_cycle(tid, visited, [])
-        if cycle:
-            youngest_tid = max(cycle, key=lambda x: self.transactions[x].get_timestamp())
-            print(f"T{youngest_tid} aborts due to deadlock")
-            self.abort(youngest_tid)
+        stack = set()
 
-    def _detect_cycle(self, tid: int, visited: set, path: list) -> list:
-        if tid in path:
-            return path[path.index(tid):]
-        if tid in visited:
-            return []
-        visited.add(tid)
-        path.append(tid)
-        for neighbor in self.waits_for_graph[tid]:
-            result = self._detect_cycle(neighbor, visited, path)
-            if result:
-                return result
-        path.pop()
-        return []
+        def dfs(node):
+            if node in stack:  # Cycle detected
+                return True
+            if node in visited:
+                return False
 
+            visited.add(node)
+            stack.add(node)
+            for neighbor in self.serialization_graph.get(node, []):
+                if dfs(neighbor):
+                    return True
+            stack.remove(node)
+            return False
 
-# Displaying to verify correctness before implementing the main driver.
-TransactionManager
+        return any(dfs(node) for node in self.serialization_graph)
+
+    def get_last_transaction_in_cycle(self):
+        """Identify the last transaction in the cycle."""
+        visited = set()
+        stack = []
+
+        def dfs(node):
+            if node in stack:
+                return node  # Return the node that closes the cycle
+            if node in visited:
+                return None
+
+            visited.add(node)
+            stack.append(node)
+            for neighbor in self.serialization_graph.get(node, []):
+                result = dfs(neighbor)
+                if result is not None:
+                    return result
+            stack.pop()
+            return None
+
+        for node in self.serialization_graph:
+            stack.clear()
+            result = dfs(node)
+            if result is not None:
+                return max(stack, key=lambda tid: self.transactions[tid].start_time)
+
+        return None
+
