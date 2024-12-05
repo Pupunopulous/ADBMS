@@ -1,114 +1,85 @@
-from typing import Dict, List
-
-from Variable import Variable
-from LockManager import LockManager
-from Transaction import TransactionType
-from Operation import Operation, OperationType
-
 class DataManager:
-    VARIABLE_COUNT = 20
+    def __init__(self, site_id):
+        self.site_id = site_id
+        self.variables = {}  # Tracks current committed values: variable -> value
+        self.status = "up"  # Current status of the site: "up" or "down"
+        self.version_history = {}  # Tracks version history: variable -> list of [value, commit_time]
+        self.committed_after_recovery = set()  # Tracks variables committed to after recovery
 
-    def __init__(self, sid: int):
-        self.id = sid
-        self.active = True
-        self.variables: Dict[int, Variable] = {}
-        self.lock_managers: Dict[int, LockManager] = {}
+    def read(self, variable, start_time):
+        """
+        Return the value of a variable for a transaction's snapshot.
+        A transaction sees the most recent version committed before its start time.
+        Reads are permitted only if the site is up and a write has been committed
+        to the variable after recovery (if applicable).
+        """
+        if self.status != "up":
+            raise Exception(f"Site {self.site_id} is down, cannot read {variable}.")
+        if variable not in self.version_history:
+            raise Exception(f"Variable {variable} not found at Site {self.site_id}.")
+        #if variable not in self.committed_after_recovery:
+        #    raise Exception(f"Variable {variable} has not been committed to after recovery at Site {self.site_id}.")
 
-        for i in range(1, DataManager.VARIABLE_COUNT + 1):
-            if i % 2 == 0 or (i % 10 + 1) == sid:
-                self.variables[i] = Variable(i)
-                self.lock_managers[i] = LockManager(i)
+        # Find the most recent version committed before start_time
+        for value, commit_time in reversed(self.version_history[variable]):
+            if commit_time <= start_time:
+                return value
 
-    def get_id(self) -> int:
-        return self.id
+        raise Exception(f"No valid version of {variable} found at Site {self.site_id} for start_time {start_time}.")
 
-    def is_active(self) -> bool:
-        return self.active
+    def write(self, variable, value, commit_time):
+        """
+        Write a new value to a variable.
+        The new version is added to the version history, and the variable
+        is marked as committed after recovery.
+        """
+        if self.status != "up":
+            raise Exception(f"Site {self.site_id} is down, cannot write to {variable}.")
 
-    def contains_variable(self, vid: int) -> bool:
-        return vid in self.variables
+        if variable not in self.version_history:
+            self.version_history[variable] = []
 
-    def can_read(self, ttype: TransactionType, operation: Operation) -> bool:
-        if not self.is_active or operation.get_variable_id() not in self.variables:
-            return False
-        variable = self.variables[operation.get_variable_id()]
-        if not variable.is_readable():
-            return False
-        if ttype == TransactionType.READ_WRITE:
-            return self.lock_managers[operation.get_variable_id()].can_acquire_lock(
-                operation.get_type(), operation.get_transaction_id()
-            )
-        return True
+        # Append the new version to the history
+        self.version_history[variable].append([value, commit_time])
+        self.variables[variable] = value  # Update the current value
+        self.committed_after_recovery.add(variable)  # Mark as committed after recovery
+        #print(f"Wrote {variable} = {value} at Site {self.site_id} with commit_time {commit_time}.")
 
-    def read(self, ttype: TransactionType, ts: int, operation: Operation) -> int:
-        if operation.get_type() == OperationType.READ and self.can_read(ttype, operation):
-            variable = self.variables[operation.get_variable_id()]
-            if ttype == TransactionType.READ_ONLY:
-                return self.read_by_read_only_transaction(ts, operation, variable)
-            else:
-                self.lock_managers[operation.get_variable_id()].lock(
-                    operation.get_type(), operation.get_transaction_id(), operation.get_variable_id()
-                )
-                return self.read_by_read_write_transaction(operation, variable)
-        return 0
+    def fail(self):
+        """
+        Simulate a site failure.
+        All operations (read/write) will fail until recovery.
+        Clears the variable histories except for the last committed one.
+        """
+        self.status = "down"
+        self.committed_after_recovery.clear()  # Clear tracking for replicated variables
 
-    def read_by_read_only_transaction(self, ts: int, operation: Operation, variable: Variable) -> int:
-        value = variable.get_last_committed_value_before(ts)
-        operation.set_value(value)
-        return value
+        # Retain only the last committed entry in the version history
+        for variable, history in self.version_history.items():
+            if history:
+                # Keep only the last committed entry
+                self.version_history[variable] = [history[-1]]  # Clear the committed-after-recovery tracker
+        #print(f"Site {self.site_id} has failed.")
 
-    def read_by_read_write_transaction(self, operation: Operation, variable: Variable) -> int:
-        if variable.get_transaction_id_to_commit() == operation.get_transaction_id():
-            value = variable.get_value_to_commit()
-            operation.set_value(value)
-            return value
-        else:
-            value = variable.get_last_committed_value()
-            operation.set_value(value)
-            return value
+    def recover(self):
+        """
+        Simulate a site recovery.
+        - Non-replicated variables (odd-numbered) are tracked for availability.
+        - Replicated variables (even-numbered) are immediately available for writes but not reads
+        until consistency is re-established.
+        """
+        self.status = "up"
+        #print(f"Site {self.site_id} has recovered.")
 
-    def can_write(self, ttype: TransactionType, operation: Operation) -> bool:
-        if not self.is_active or ttype == TransactionType.READ_ONLY or operation.get_variable_id() not in self.variables:
-            return False
-        return self.lock_managers[operation.get_variable_id()].can_acquire_lock(
-            operation.get_type(), operation.get_transaction_id()
-        )
+        # Update the availability of variables
+        for variable in self.variables:
+            variable_index = int(variable[1:])  # Extract the numeric part of the variable name
 
-    def write(self, ttype: TransactionType, operation: Operation) -> None:
-        if operation.get_type() == OperationType.WRITE and self.can_write(ttype, operation):
-            lock_manager = self.lock_managers[operation.get_variable_id()]
-            lock_manager.lock(operation.get_type(), operation.get_transaction_id(), operation.get_variable_id())
-            variable = self.variables[operation.get_variable_id()]
-            variable.set_value_to_commit(operation.get_value())
-            variable.set_transaction_id_to_commit(operation.get_transaction_id())
+            if variable_index % 2 != 0:
+                # Non-replicated (odd-numbered) variables: require tracking for reads after recovery
+                if variable not in self.committed_after_recovery:
+                    self.committed_after_recovery.add(variable)  # Add to post-recovery tracking
+                    #print(f"Non-replicated variable {variable} at Site {self.site_id} is tracked for post-recovery writes."
 
-    def get_lock_holders(self, vid: int) -> List[int]:
-        if vid in self.lock_managers:
-            return self.lock_managers[vid].get_lock_holders()
-        return []
-
-    def abort(self, tid: int) -> None:
-        for lock_manager in self.lock_managers.values():
-            lock_manager.unlock(tid)
-
-    def commit(self, tid: int, ts: int) -> None:
-        for lock_manager in self.lock_managers.values():
-            if lock_manager.is_write_locked_by(tid):
-                self.variables[lock_manager.get_variable_id()].commit(ts)
-            lock_manager.unlock(tid)
-
-    def dump(self) -> None:
-        variables = [str(self.variables[i]) for i in range(1, DataManager.VARIABLE_COUNT + 1) if i in self.variables]
-        print(f"site {self.id} - {', '.join(variables)}")
-
-    def fail(self) -> None:
-        self.active = False
-        for variable in self.variables.values():
-            variable.fail()
-        for lock_manager in self.lock_managers.values():
-            lock_manager.unlock_all()
-
-    def recover(self) -> None:
-        self.active = True
-        for variable in self.variables.values():
-            variable.recover()
+                # Replicated (even-numbered) variables: available for writes, not reads
+                #print(f"Replicated variable {variable} at Site {self.site_id} is available for writes but not reads.")
