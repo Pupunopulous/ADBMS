@@ -4,10 +4,10 @@ from TransactionManager import TransactionManager
 
 class Main:
     @staticmethod
-    def main(input_file: str) -> None:
+    def main(test_file: str) -> None:
         transaction_manager = TransactionManager()
         try:
-            with open(input_file, "r") as file:
+            with open(test_file, "r") as file:
                 timestamp = 1  # Logical timestamp to simulate the order of operations
                 for line in file:
                     line = line.strip()
@@ -50,13 +50,13 @@ class Main:
                     elif command == "dump":
                         transaction_manager.querystate()
                     else:
-                        print(f"Unknown command: {command}", file=sys.stderr)
+                        print(f"Unknown command: {command}", file = sys.stderr)
 
                     # Increment the logical timestamp after processing each line
                     timestamp += 1
 
         except Exception as e:
-            print(f"Error: {e}", file=sys.stderr)
+            print(f"Error: {e}", file = sys.stderr)
 
 
 if __name__ == "__main__":
