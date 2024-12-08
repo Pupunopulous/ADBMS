@@ -15,7 +15,9 @@ class TransactionManager:
         self.initialize_data()
 
     def initialize_data(self):
-        """Initialize the 20 variables across the 10 sites based on their index."""
+        """
+        Initialize the 20 variables across the 10 sites based on their index.
+        """
         for i in range(1, 21):  # Variables x1 to x20
             initial_value = 10 * i
             if i % 2 == 0:  # Even-indexed variables
@@ -26,13 +28,21 @@ class TransactionManager:
                 self.sites[site_id].write(f"x{i}", initial_value, 0)
 
     def print_serialization_graph(self):
+        # Check if there's at least one edge in the graph
+        if not any(self.serialization_graph.values()):
+            # No edges found, so do not print anything
+            return
+
         print("\n--- Serialization Graph ---")
         for from_tid, to_tids in self.serialization_graph.items():
-            print(f"T{from_tid} -> {', '.join(f'T{tid}' for tid in to_tids)}")
-        print("----------------------------")
+            if to_tids:  # Only print if this node has outgoing edges
+                print(f"T{from_tid} -> {', '.join(f'T{tid}' for tid in to_tids)}")
+        print("---------------------------")
 
     def start_transaction(self, transaction_id, timestamp, is_read_only=False):
-        """Begin a new transaction."""
+        """
+        Begin a new transaction.
+        """
         print(f"Starting {'read-only ' if is_read_only else ''}transaction T{transaction_id} at timestamp {timestamp}.")
         self.transactions[transaction_id] = Transaction(transaction_id, timestamp, is_read_only)
 
@@ -130,121 +140,113 @@ class TransactionManager:
 
     def commit(self, transaction_id, time):
         """
-        Commit a transaction after validation.
-        Implements:
-        1. First Committer Wins rule.
-        2. Abort if any write timestamp precedes the failure timestamp of a site.
+        Commit a transaction after validation using DataManager methods.
+        This method now delegates:
+        - First Committer Wins checks
+        - Failure timestamp checks
+        - Variable availability checks
+        to the DataManager via `can_write_variable`.
+
+        Steps:
+        1. Validate that each intended write is permissible using DataManager's `can_write_variable`.
+        2. If validation passes for all writes, apply the writes.
+        3. Update the serialization graph.
+        4. Check for cycles; if found, abort the youngest transaction in the cycle.
+        5. Otherwise, mark this transaction as committed.
         """
         if transaction_id not in self.transactions:
             raise Exception(f"Transaction T{transaction_id} does not exist.")
 
         transaction = self.transactions[transaction_id]
 
-        # Check for First Committer Wins violation and failure timestamp validation
+        # Validate each write before committing
         for variable, (value, write_timestamp) in transaction.write_set.items():
-            for site_id, site in self.sites.items():
-                if self.site_status[site_id] == "up" and (variable in site.variables or variable.startswith("x")):
-                    # First Committer Wins Check
-                    if variable in site.version_history:
-                        last_commit_time = site.version_history[variable][-1][1]
-                        if last_commit_time > transaction.start_time:
-                            print(
-                                f"Transaction T{transaction_id} aborted: {variable} was committed at {last_commit_time}, "
-                                f"after transaction start time {transaction.start_time}.")
-                            transaction.status = "aborted"
-                            return
-
-                # Failure Timestamp Validation
-                for failure_timestamp, status in self.failure_history[site_id]:
-                    if status == "down" and write_timestamp < failure_timestamp:
-                        print(
-                            f"Transaction T{transaction_id} aborted: Write timestamp {write_timestamp} for {variable} "
-                            f"precedes failure timestamp {failure_timestamp} on Site {site_id}.")
-                        transaction.status = "aborted"
-                        return
-
-        for variable, (value, write_timestamp) in transaction.write_set.items():
-            # Distribute writes to the appropriate sites
-            written_sites = set()
-            variable_index = int(variable[1:])  # Extract the numeric part of the variable name
-
+            variable_index = int(variable[1:])
             if variable_index % 2 == 0:
-                # Even-indexed variables: Write to all sites that are up
+                # Even-indexed: replicated at all sites
                 for site_id, site in self.sites.items():
                     if self.site_status[site_id] == "up" and variable in site.variables:
-                        # Retrieve the last recovery timestamp
-                        last_recovery_time = max(
-                            (timestamp for timestamp, status in self.failure_history[site_id] if status == "up"),
-                            default=None
-                        )
+                        # Check if we can write this variable to this site
+                        if not site.can_write_variable(variable, write_timestamp, transaction.start_time,
+                                                       self.failure_history[site_id]):
+                            print(f"Transaction T{transaction_id} aborted: Cannot write {variable} to Site {site_id}.")
+                            transaction.status = "aborted"
+                            return
+            else:
+                # Odd-indexed: stored at a single site
+                site_id = 1 + (variable_index % 10)
+                if self.site_status[site_id] == "up" and variable in self.sites[site_id].variables:
+                    if not self.sites[site_id].can_write_variable(variable, write_timestamp, transaction.start_time,
+                                                                  self.failure_history[site_id]):
+                        print(f"Transaction T{transaction_id} aborted: Cannot write {variable} to Site {site_id}.")
+                        transaction.status = "aborted"
+                        return
+                else:
+                    # If the designated site is down or doesn't have the variable, we must abort
+                    print(
+                        f"Transaction T{transaction_id} aborted: Site {site_id} is not available for writing {variable}.")
+                    transaction.status = "aborted"
+                    return
 
-                        # Check if the write timestamp is valid
-                        if last_recovery_time is not None and write_timestamp < last_recovery_time:
-                            continue
-
-                        # Perform the write and track the site
+        # If all validations pass, perform the actual writes
+        for variable, (value, write_timestamp) in transaction.write_set.items():
+            written_sites = set()
+            variable_index = int(variable[1:])
+            if variable_index % 2 == 0:
+                # Even-indexed variables: write to all up sites that have the variable
+                for site_id, site in self.sites.items():
+                    if self.site_status[site_id] == "up" and variable in site.variables:
                         site.write(variable, value, write_timestamp)
                         written_sites.add(site_id)
             else:
-                # Odd-indexed variables: Write to a single designated site
+                # Odd-indexed variables: write to the single designated site
                 site_id = 1 + (variable_index % 10)
                 if self.site_status[site_id] == "up" and variable in self.sites[site_id].variables:
-                    # Retrieve the last recovery timestamp
-                    last_recovery_time = max(
-                        (timestamp for timestamp, status in self.failure_history[site_id] if status == "up"),
-                        default=None
-                    )
-
-                    # Check if the write timestamp is valid
-                    if last_recovery_time is not None and write_timestamp < last_recovery_time:
-                        continue
-
-                    # Perform the write and track the site
                     self.sites[site_id].write(variable, value, write_timestamp)
                     written_sites.add(site_id)
 
-            # Print the sites written to in a single line
             if written_sites:
-                written_sites_list = sorted(written_sites)  # Sort for consistent output
+                written_sites_list = sorted(written_sites)
                 print(
                     f"Transaction T{transaction_id} wrote {variable} to sites: {', '.join(map(str, written_sites_list))}")
 
-            # Construct edges in the serialization graph
-            for other_tid, other_txn in self.transactions.items():
-                if other_tid == transaction_id or other_txn.status != "committed":
-                    continue
+        # Build edges in the serialization graph
+        for other_tid, other_txn in self.transactions.items():
+            if other_tid == transaction_id or other_txn.status != "committed":
+                continue
 
-                # RW Edge: other_tid wrote to a variable that transaction_id read
-                if any(var in other_txn.write_set for var in transaction.read_set):
-                    self.add_dependency(transaction_id, other_tid)
+            # RW Edge: other_tid wrote a variable that this transaction read
+            if any(var in other_txn.write_set for var in transaction.read_set):
+                self.add_dependency(transaction_id, other_tid)
 
-                # WR Edge: transaction_id wrote to a variable that other_tid read
-                if any(var in transaction.write_set for var in other_txn.read_set):
-                    self.add_dependency(other_tid, transaction_id)
+            # WR Edge: this transaction wrote a variable that other_tid read
+            if any(var in transaction.write_set for var in other_txn.read_set):
+                self.add_dependency(other_tid, transaction_id)
 
-                # WW Edge: both transactions wrote to the same variable
-                if any(var in transaction.write_set for var in other_txn.write_set):
-                    self.add_dependency(other_tid, transaction_id)
+            # WW Edge: both wrote the same variable
+            if any(var in transaction.write_set for var in other_txn.write_set):
+                self.add_dependency(other_tid, transaction_id)
 
-            # Print serialization graph for debugging
-            self.print_serialization_graph()
+        # Print the serialization graph for debugging
+        self.print_serialization_graph()
 
-            # Check for cycles in the serialization graph
-            if self.has_cycle():
-                last_tid = self.get_last_transaction_in_cycle()
-                print(f"Cycle detected! Aborting transaction T{last_tid}.")
-                self.transactions[last_tid].status = "aborted"
-                self.remove_transaction_from_graph(last_tid)
-                return
+        # Check for cycles in the serialization graph
+        if self.has_cycle():
+            last_tid = self.get_last_transaction_in_cycle()
+            print(f"Cycle detected! Aborting transaction T{last_tid}.")
+            self.transactions[last_tid].status = "aborted"
+            self.remove_transaction_from_graph(last_tid)
+            return
 
-        # Mark the transaction as committed
+        # If no cycle, commit the transaction
         transaction.status = "committed"
         print(f"Transaction T{transaction_id} has been committed.")
 
     def update_site_status(self, site_id, status, timestamp):
         """
         Update the status of a site (up/down).
-        Records the failure or recovery event with a timestamp.
+        If the site recovers, we now use the DataManager's get_readable_value_after_recovery method
+        to attempt reads for transactions that were waiting on this site's data.
         """
         if site_id not in self.sites:
             raise Exception(f"Site {site_id} does not exist.")
@@ -262,23 +264,29 @@ class TransactionManager:
                 self.site_status[site_id] = status
                 print(f"Site {site_id} has been recovered.")
 
-                # Process the waiting read queue
-                for entry in list(self.waiting_read_queue):  # Use a copy to allow modification during iteration
+                # Process the waiting read queue for this recovered site
+                for entry in list(self.waiting_read_queue):  # use a copy to allow safe removal
                     transaction_id, variable_index, waiting_site_id = entry
-                    if waiting_site_id == site_id:  # Check if the recovered site matches the waiting read site
-                        variable = f"x{variable_index}"  # Convert the variable index back to its name
-                        try:
-                            value = self.sites[site_id].read(variable, self.transactions[transaction_id].start_time)
-                            print(
-                                f"Transaction T{transaction_id} read {variable}:{value} from recovered Site {site_id}.")
-                            # Remove the entry from the queue since it has been processed
-                            self.waiting_read_queue.remove(entry)
-                        except Exception as e:
-                            print(
-                                f"Transaction T{transaction_id} failed to read {variable} from recovered Site {site_id}: {e}")
+                    if waiting_site_id == site_id:
+                        variable = f"x{variable_index}"
+                        txn = self.transactions.get(transaction_id)
+                        if txn is not None and txn.status == "active":
+                            # Attempt to read using DataManager's helper
+                            value = self.sites[site_id].get_readable_value_after_recovery(
+                                variable,
+                                txn.start_time,
+                                self.failure_history[site_id]
+                            )
+                            if value is not None:
+                                print(
+                                    f"Transaction T{transaction_id} read {variable}:{value} from recovered Site {site_id}.")
+                                # Remove the entry from the queue since it succeeded
+                                self.waiting_read_queue.remove(entry)
+                            else :
+                                print(f"Transaction T{transaction_id} failed to read {variable} from recovered Site {site_id}.")
+            # If the site was already up, no action needed.
 
         self.site_status[site_id] = status
-        # print(f"Site {site_id} status updated to {status} at timestamp {timestamp}.")
 
     def get_failure_history(self, site_id):
         """
@@ -289,7 +297,9 @@ class TransactionManager:
         return self.failure_history[site_id]
 
     def querystate(self):
-        """Print the current state of the system for debugging."""
+        """
+        Print the current state of the system for debugging.
+        """
         print("\n--- Dump State ---")
         for site_id, dm in self.sites.items():
             # Sort variables by the numeric part of their names
@@ -306,20 +316,26 @@ class TransactionManager:
         print("--------------------")
 
     def add_dependency(self, from_tid, to_tid):
-        """Add a directed edge in the serialization graph."""
+        """
+        Add a directed edge in the serialization graph.
+        """
         if from_tid not in self.serialization_graph:
             self.serialization_graph[from_tid] = set()
         self.serialization_graph[from_tid].add(to_tid)
 
     def remove_transaction_from_graph(self, tid):
-        """Remove a transaction from the graph."""
+        """
+        Remove a transaction from the graph.
+        """
         if tid in self.serialization_graph:
             del self.serialization_graph[tid]
         for dependencies in self.serialization_graph.values():
             dependencies.discard(tid)
 
     def has_cycle(self):
-        """Detect a cycle in the serialization graph."""
+        """
+        Detect a cycle in the serialization graph.
+        """
         visited = set()
         stack = set()
 
@@ -340,7 +356,9 @@ class TransactionManager:
         return any(dfs(node) for node in self.serialization_graph)
 
     def get_last_transaction_in_cycle(self):
-        """Identify the last transaction in the cycle."""
+        """
+        Identify the last transaction in the cycle.
+        """
         visited = set()
         stack = []
 
@@ -366,4 +384,3 @@ class TransactionManager:
                 return max(stack, key=lambda tid: self.transactions[tid].start_time)
 
         return None
-
