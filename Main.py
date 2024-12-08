@@ -13,6 +13,7 @@ It acts as a bridge between user input and the core functionality provided by th
 
 import re
 import sys
+import argparse
 from TransactionManager import TransactionManager
 
 
@@ -73,7 +74,7 @@ class Main:
                         transaction_manager.querystate()
 
                     else:
-                        print(f"Unknown command: {command}", file=sys.stderr)
+                        print(f"Unknown command: {command}", file = sys.stderr)
 
                     # Increment the logical timestamp after processing each line
                     timestamp += 1
@@ -83,5 +84,19 @@ class Main:
 
 
 if __name__ == "__main__":
-    input_file = "test.txt"  # Replace with the actual path to your test case file
+    """
+    input_file = "test.txt"
     Main.main(input_file)
+    """
+
+    # Use argparse to handle command-line arguments
+    parser = argparse.ArgumentParser(description = "Replicated Concurrency Control and Recovery")
+    parser.add_argument(
+        "input_file",
+        type = str,
+        help = "Path to the input file containing transaction commands"
+    )
+    args = parser.parse_args()
+
+    # Pass the input file to the main function
+    Main.main(args.input_file)
