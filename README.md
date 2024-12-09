@@ -97,7 +97,7 @@ For testing new input sequences on the Reprozip executable, move into the inputs
   cd RepCRec/root/home/rk4748/RepCRec/root/home/rk4748/RepCRec/tests/
   nano newtest.txt
   ```
-Finally, run the executable again:
+Finally, run the executable from the home directory again:
   ```bash
   reprounzip directory run RepCRec
   ```
