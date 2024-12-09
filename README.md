@@ -61,7 +61,7 @@ Commands in the input files follow a specific structure:
 - **Commit a transaction**: `end(T1)`
 - **Dump system state**: `dump()`
 
-Each line represents a single command. Empty lines or comments (starting with `//` or `#`)
+Each line represents a single command. Empty lines or comments (starting with `//` or `#`) are ignored.
 
 ---
 
