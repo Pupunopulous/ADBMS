@@ -29,7 +29,7 @@ class Transaction:
         if variable not in self.read_set:
             self.read_set.add(variable)
 
-    def add_write(self, variable, value,timestamp):
+    def add_write(self, variable, value, timestamp):
         """
         Add a variable and its value to the transaction's write set.
         Overwrites any previous value for the same variable in the write set.
