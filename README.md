@@ -82,7 +82,7 @@ You can unpack the project as follows:
   reprounzip directory run RepCRec
   ```
 
-### 3. **Verify outputs**
+### 3. **Verify Outputs**
 You can find all files within the `root` directory of the unzipped folder as follows:
   ```bash
   cd RepCRec/root/home/rk4748/RepCRec/
@@ -90,3 +90,14 @@ You can find all files within the `root` directory of the unzipped folder as fol
 The input test files will be within the `tests/` folder.
 
 The output files for these tests will be within the `outputs/` folder.
+
+### 4. **Change Inputs and test Reprozip executable**
+For testing new input sequences on the Reprozip executable, move into the inputs folder within the unzipped directory, and add your new file here.
+  ```bash
+  cd RepCRec/root/home/rk4748/RepCRec/root/home/rk4748/RepCRec/tests/
+  nano newtest.txt
+  ```
+Finally, run the executable again:
+  ```bash
+  reprounzip directory run RepCRec
+  ```
