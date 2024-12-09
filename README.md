@@ -7,7 +7,7 @@
 
 ---
 
-This project implements a **Replicated Concurrency Control and Recovery System**. It processes a sequence of commands related to transaction management, concurrency control, and recovery in a distributed database system.
+This project implements a **Replicated Concurrency Control and Recovery System**. It processes a sequence of commands related to transaction management, concurrency control, and recovery in a distributed database system. Please peruse the design document for complete working details.
 
 The system reads transaction commands from input files stored in the `tests/` directory, processes them, and writes the outputs to corresponding files in the `outputs/` directory.
 
